@@ -1,5 +1,5 @@
 from typing import Dict, Any
-from langgraph.graph import StateGraph
+from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from .models import ResearchState, CompanyAnalysis, CompanyInfo
@@ -15,7 +15,15 @@ class Workflow:
         self.workflow = self._build_workflow()
 
     def _build_workflow(self):
-        pass
+        graph = StateGraph(ResearchState)
+        graph.add_node("extract_tools", self._extract_tools_step)
+        graph.add_node("research", self._research_step)
+        graph.add_node("analyse", self._analyse_step)
+        graph.set_entry_point("extract_tools")
+        graph.add_edge(start_key="extract_tools", end_key="research")
+        graph.add_edge(start_key="research", end_key="analyse")
+        graph.add_edge(start_key="analyse", end_key=END)
+        return graph.compile()
 
     def _extract_tools_step(self, state: ResearchState) -> Dict[str, Any]:
         print(f"🔎 Finding articles about: {state.query}")
@@ -27,7 +35,7 @@ class Workflow:
             url = result.get("url", "")
             scraped = self.firecrawl.scrape_company_pages(url)
             if scraped:
-                all_content + scraped.markdown[:1500] + "\n\n"
+                all_content += scraped.markdown[:1500] + "\n\n"
         messages = [
             SystemMessage(content=self.prompts.TOOL_EXTRACTION_SYSTEM),
             HumanMessage(
@@ -73,3 +81,68 @@ class Workflow:
                 language_support=[],
                 integration_capabilities=[],
             )
+
+    def _research_step(self, state: ResearchState) -> Dict[str, Any]:
+        extracted_tools = getattr(state, "extracted_tools", [])
+
+        if not extracted_tools:
+            print(" ⚠️No extracted tools found, fallind back to direct search")
+            search_results = self.firecrawl.search_companies(state.query, num_results=4)
+            tool_names = [
+                result.get("metadata", {}).get("title", "Unkown")
+                for result in search_results.data
+            ]
+        else:
+            tool_names = extracted_tools[:4]
+
+        print(f"🔬 Researching specific tools: {', '.join(tool_names)}")
+        companies = []
+        for tool_name in tool_names:
+            tool_research_results = self.firecrawl.search_companies(
+                tool_name + " official site", num_results=1
+            )
+            if tool_research_results:
+                result = tool_research_results.data[0]
+                url = result.get("url", "")
+                company = CompanyInfo(
+                    name=tool_name,
+                    description=result.get("markdown", ""),
+                    website=url,
+                    tech_stack=[],
+                    competitors=[],
+                )
+                scraped = self.firecrawl.scrape_company_pages(url)
+                if scraped:
+                    content = scraped.markdown
+                    analysis = self._analyze_company_content(company.name, content)
+                    company.pricing_model = analysis.pricing_model
+                    company.is_open_source = analysis.is_open_source
+                    company.tech_stack = analysis.tech_stack
+                    company.description = analysis.description
+                    company.api_available = analysis.api_available
+                    company.language_support = analysis.language_support
+                    company.integration_capabilities = analysis.integration_capabilities
+
+                companies.append(company)
+        return {"companies": companies}
+
+    def _analyse_step(self, state: ResearchState) -> Dict[str, Any]:
+        print("Generating recommendations")
+
+        company_data = ", ".join(
+            [company.model_dump_json() for company in state.companies]
+        )
+        messages = [
+            SystemMessage(content=self.prompts.RECOMMENDATIONS_SYSTEM),
+            HumanMessage(
+                content=self.prompts.recommendations_user(state.query, company_data)
+            ),
+        ]
+
+        response = self.llm.invoke(messages)
+        return {"analysis": response.content}
+
+    def run(self, query: str) -> ResearchState:
+        initial_state = ResearchState(query=query)
+        final_state = self.workflow.invoke(initial_state)
+        return ResearchState(**final_state)
